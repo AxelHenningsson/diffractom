@@ -32,8 +32,9 @@ class SinglePhaseForwardOperator:
         normalized: bool = False,
         ctx: cl.Context | None = None,
         queue: cl.CommandQueue | None = None,
-        pf_mode: str = "dense",
-        sparse_max_fill: float = 0.02,
+        pf_mode: str = "auto",
+        sparse_max_fill: float = 0.1,
+        sparse_max_gb: float | None = None,
         **kwargs,
     ):
         """Initialise the single-material forward operator.
@@ -55,20 +56,29 @@ class SinglePhaseForwardOperator:
             If True, skip intensity scaling of the PF matrix.
         ctx, queue : optional
             Existing OpenCL context/queue; created automatically if None.
-        pf_mode : {"dense", "sparse", "auto"}
+        pf_mode : {"auto", "sparse", "dense"}
             How the pole-figure (PF) matrix is applied.
 
-            * ``"dense"``: the PF matrix is evaluated batch by batch in every
-              call and applied with a dense batched GEMM. When all orientations
-              fit in one batch, it is evaluated once and reused.
             * ``"sparse"``: the PF matrix is evaluated once here, stored in a
               sparse (CSR) format, and applied with sparse kernels. Its entries
               are exactly zero away from the poles, so this is the same operator.
-              Fastest for narrow kernels (small sigma).
-            * ``"auto"``: sparse if the fill fraction of the first batch is at
-              most ``sparse_max_fill``, dense otherwise.
+            * ``"dense"``: the PF matrix is applied with a dense batched GEMM.
+              If all orientations fit in one batch (``max_gb``), it is evaluated
+              once and reused; otherwise it is re-evaluated batch by batch in
+              every call.
+            * ``"auto"`` (default): sparse, unless the fill fraction of the first
+              batch exceeds ``sparse_max_fill`` or the sparse matrix would not fit
+              in ``sparse_max_gb``; dense otherwise.
+
+            Measured on an A100 (simulated Al data, 360 omega x 180 eta x 8
+            rings): sparse was 1.4-2.6x faster per FISTA iteration than dense for
+            fill fractions of 0.2 % (sigma = 0.4 deg) and 5 % (sigma = 2 deg).
         sparse_max_fill : float
-            Fill-fraction threshold used by ``pf_mode="auto"``.
+            Largest fill fraction for which ``pf_mode="auto"`` chooses sparse.
+            The default, 10 %, is roughly where the two break even.
+        sparse_max_gb : float, optional
+            GPU memory budget (GB) for the sparse matrix, estimated from the first
+            batch. Default: half of the device's global memory.
         **kwargs
             Override any cfg key (e.g. ``N_Omega=50``).
         """
@@ -156,8 +166,14 @@ class SinglePhaseForwardOperator:
         self.pf_mode = pf_mode
         self._pf_cached = False  # dense mode, single batch: PF matrix already in _basis_batch_kmax
         self.sparse_batches = None
+        if sparse_max_gb is None:
+            sparse_max_gb = self.queue.device.global_mem_size / 2 / 1024**3
         if pf_mode in ("sparse", "auto"):
-            self.build_sparse_pf(auto=(pf_mode == "auto"), max_fill=sparse_max_fill)
+            self.build_sparse_pf(auto=(pf_mode == "auto"), max_fill=sparse_max_fill, max_gb=sparse_max_gb)
+        if self.verbose:
+            cached = self.pf_mode == "sparse" or len(self.batches) == 1
+            print(f"PF matrix: {self.pf_mode}, "
+                  + ("evaluated once" if cached else f"re-evaluated in {len(self.batches)} batches per call"))
 
 
     def detector_coordinates(self):
@@ -538,12 +554,16 @@ class SinglePhaseForwardOperator:
 
 
 
-    def build_sparse_pf(self, auto=False, max_fill=0.02):
+    def build_sparse_pf(self, auto=False, max_fill=0.1, max_gb=None):
         """
         Evaluate the PF matrix once and store it per K-batch in two CSR
         structures: forward rows (r, j) listing orientations, and adjoint rows
-        (r, k) listing segments, j = c*P + p. With ``auto``, fall back to dense
-        mode if the fill fraction of the first batch exceeds ``max_fill``.
+        (r, k) listing segments, j = c*P + p.
+
+        The size of the whole sparse matrix is estimated from the first batch.
+        With ``auto``, fall back to dense mode if the fill fraction of the first
+        batch exceeds ``max_fill`` or the estimate exceeds ``max_gb``; without,
+        raise MemoryError if it exceeds ``max_gb``.
         """
         t0 = time.perf_counter()
         q = self.queue
@@ -573,14 +593,24 @@ class SinglePhaseForwardOperator:
             k0, Kb = b["k_start"], b["K_batch"]
             self._eval_pf_batch(k0, Kb)
             row_ptr_f, col_k, val_f, nnz = csr(self.k.pf_count_rows_fwd, self.k.pf_fill_rows_fwd, R * CP, Kb)
-            if auto and ib == 0 and nnz / (R * Kb * CP) > max_fill:
-                for arr in (row_ptr_f, col_k, val_f):
-                    arr.base_data.release()
-                self.pf_mode = "dense"
-                if self.verbose:
-                    print(f"PF matrix fill fraction {100 * nnz / (R * Kb * CP):.2f} % > "
-                          f"{100 * max_fill:.2f} %: using the dense PF path")
-                return
+            if ib == 0:
+                fill = nnz / (R * Kb * CP)
+                # two CSR copies (index + value, 4 B each) plus the row pointers of all batches
+                est_gb = (16 * fill * R * self.K * CP + 4 * (len(self.batches) * R * CP + R * self.K)) / 1024**3
+                reason = None
+                if auto and fill > max_fill:
+                    reason = f"fill fraction {100 * fill:.2f} % > {100 * max_fill:.2f} %"
+                elif max_gb is not None and est_gb > max_gb:
+                    reason = f"estimated size {est_gb:.1f} GB > {max_gb:.1f} GB"
+                    if not auto:
+                        raise MemoryError(f"Sparse PF matrix: {reason}; use pf_mode='dense' or raise sparse_max_gb.")
+                if reason is not None:
+                    for arr in (row_ptr_f, col_k, val_f):
+                        arr.base_data.release()
+                    self.pf_mode = "dense"
+                    if self.verbose:
+                        print(f"Sparse PF matrix: {reason}, using the dense PF path")
+                    return
             row_ptr_a, col_j, val_a, nnz_a = csr(self.k.pf_count_rows_adj, self.k.pf_fill_rows_adj, R * Kb, Kb)
             assert nnz_a == nnz
             sparse_batches.append(dict(row_ptr_f=row_ptr_f, col_k=col_k, val_f=val_f,
