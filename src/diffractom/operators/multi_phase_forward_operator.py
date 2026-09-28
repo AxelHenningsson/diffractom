@@ -142,7 +142,7 @@ class MultiPhaseForwardOperator:
 
         Coords shape per material: (N_Omega, N_Omega_sub, N_eta, N_eta_sub, N_peaks, 3)
         """
-        wavelength_angstrom = 12.398 / self.cfg["wavelength"]
+        wavelength_A = 12.398 / self.cfg["energy"]
         S_omega = self.N_Omega_subdivisions
         S_eta = self.N_eta_subdivisions
         N_fine_omega = self.N_Omega * S_omega
@@ -170,7 +170,7 @@ class MultiPhaseForwardOperator:
         for i_mat in range(self.N_mat):
             h_cpu = self.pf_h_cpu_list[i_mat]
             two_theta_peaks = 2.0 * np.arcsin(
-                np.linalg.norm(h_cpu, axis=1) / (4.0 * np.pi) * wavelength_angstrom
+                np.linalg.norm(h_cpu, axis=1) / (4.0 * np.pi) * wavelength_A
             ).astype(np.float32)
 
             coords_list = []

@@ -17,4 +17,4 @@ N_eta: 180   # number of azimuthal steps
 N_eta_subdivisions: 1  # integration samples per eta step in the pole figure transform
 eta_angle_range: [0, 360] # Start and end angle in azimuthal integration. Midpoints are used in case of 1 integration sample
 
-wavelength: 50
+energy: 50

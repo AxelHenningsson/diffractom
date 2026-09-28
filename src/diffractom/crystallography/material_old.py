@@ -68,7 +68,7 @@ class Material:
         cls,
         cif_path: str,
         *,
-        wavelength_kev: float,
+        energy_kev: float,
         min_two_theta: float,
         max_two_theta: float,
         intensity_cutoff_fraction: float = 0.0,
@@ -79,7 +79,7 @@ class Material:
 
         Parameters
         ----------
-        wavelength_kev : float
+        energy_kev : float
         min_two_theta, max_two_theta : radians
         intensity_cutoff_fraction : fraction of max intensity (0..1)
         global_intensity_norm : optional global normalization factor
@@ -117,7 +117,7 @@ class Material:
         )
 
         # ---- diffraction ----
-        wavelength = 12.398 / wavelength_kev
+        wavelength = 12.398 / energy_kev
         calc = XRDCalculator(wavelength=wavelength)
 
         pattern = calc.get_pattern(
@@ -221,7 +221,7 @@ class Material:
             "hexagonal",
             "cubic",
         ],
-        wavelength_kev: float,
+        energy_kev: float,
         min_two_theta: float = 0.0,
         max_two_theta: float = 0.0,
         global_intensity_norm: float | None = None,
@@ -250,7 +250,7 @@ class Material:
             One of: triclinic, monoclinic, orthorhombic, tetragonal, trigonal, hexagonal, cubic.
             Used to attach a point group and to compute multiplicities via point-group equivalents.
 
-        wavelength_kev
+        energy_kev
             X-ray energy in keV. Converted to wavelength in Å via λ[Å] = 12.398 / E[keV].
 
         min_two_theta, max_two_theta
@@ -408,7 +408,7 @@ class Material:
         # -------------------------
         # choose HKLs
         # -------------------------
-        wavelength_A = 12.398 / float(wavelength_kev)
+        wavelength_A = 12.398 / float(energy_kev)
 
         if hkl_list is not None:
             hkls = [tuple(map(int, hkl)) for hkl in hkl_list]

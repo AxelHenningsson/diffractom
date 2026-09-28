@@ -175,7 +175,7 @@ _REFLECTION_DTYPE = np.dtype([
 
 def _resolve_inputs(
     *,
-    wavelength_kev=None,
+    energy_kev=None,
     wavelength_A=None,
     energy_keV=None,
     min_two_theta=None,
@@ -193,8 +193,8 @@ def _resolve_inputs(
         lam = float(wavelength_A)
     elif energy_keV is not None:
         lam = 12.39842 / float(energy_keV)
-    elif wavelength_kev is not None:
-        lam = 12.39842 / float(wavelength_kev)
+    elif energy_kev is not None:
+        lam = 12.39842 / float(energy_kev)
 
     if q_min is not None and q_max is not None:
         return float(q_min), float(q_max), lam
@@ -383,13 +383,6 @@ class Material:
         self._setup_lattice(float(a), float(b), float(c),
                             float(alpha), float(beta), float(gamma))
 
-    def set_space_group(self, number: int | None = None,
-                        symbol: str | None = None) -> None:
-        """Override space group; crystal system is updated from *number* if given."""
-        self.space_group_number = number
-        self.space_group_symbol = symbol
-        if number is not None:
-            self.crystal_system = _crystal_system_from_sg(number)
 
     def load_cif(self, cif_path) -> None:
         """Parse a CIF file and populate lattice + basis (no reflection computation)."""
@@ -445,7 +438,7 @@ class Material:
         cls,
         cif_path,
         *,
-        wavelength_kev:   float | None = None,
+        energy_kev:   float | None = None,
         wavelength_A:     float | None = None,
         energy_keV:       float | None = None,
         min_two_theta:    float | None = None,
@@ -464,7 +457,7 @@ class Material:
         Provide exactly one of:
         * ``wavelength_A``   — wavelength in Å
         * ``energy_keV``     — photon energy in keV   (λ = 12.39842 / E)
-        * ``wavelength_kev`` — same as energy_keV (historical, confusingly named)
+        * ``energy_kev`` — same as energy_keV (historical, confusingly named)
 
         Reflection selection
         --------------------
@@ -479,7 +472,7 @@ class Material:
             mat.name = name
 
         q_lo, q_hi, lam = _resolve_inputs(
-            wavelength_kev=wavelength_kev, wavelength_A=wavelength_A,
+            energy_kev=energy_kev, wavelength_A=wavelength_A,
             energy_keV=energy_keV,
             min_two_theta=min_two_theta, max_two_theta=max_two_theta,
             q_min=q_min, q_max=q_max, hkl_list=hkl_list,
@@ -517,7 +510,7 @@ class Material:
         space_group_number: int | None = None,
         symbol:             int | None = None,
         # Reflection selection
-        wavelength_kev:   float | None = None,
+        energy_kev:   float | None = None,
         wavelength_A:     float | None = None,
         energy_keV:       float | None = None,
         min_two_theta:    float | None = None,
@@ -549,7 +542,7 @@ class Material:
             Crystal system used for multiplicity computation.
         space_group_number : int, optional
             Derive crystal system deterministically (takes priority over inference).
-        wavelength_kev : float
+        energy_kev : float
             Energy in keV (λ = 12.39842 / E).
         min_two_theta, max_two_theta : float
             2θ range in radians.
@@ -598,7 +591,7 @@ class Material:
 
         # ---- reflections ----
         q_lo, q_hi, lam = _resolve_inputs(
-            wavelength_kev=wavelength_kev, wavelength_A=wavelength_A,
+            energy_kev=energy_kev, wavelength_A=wavelength_A,
             energy_keV=energy_keV,
             min_two_theta=min_two_theta, max_two_theta=max_two_theta,
             q_min=q_min, q_max=q_max, hkl_list=hkl_list,
@@ -612,7 +605,7 @@ class Material:
 
         if mat.space_group_symbol is not None:
             mat.filter_extinct()
-            
+
         return mat
 
     # ------------------------------------------------------------------
