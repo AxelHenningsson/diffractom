@@ -546,54 +546,6 @@ __kernel void pf_fill_rows_adj(
     }
 }
 
-// data[r, y, j] += sum_k pf[r, k, j] * sino[y, r, k]
-// sino is gratopy's (My, R, Kmax) Fortran-order sinogram, data is (R, My, CP) C-order.
-// One work item per (row = r*CP + j, y); consecutive items share the row and read
-// consecutive y, so the sinogram reads are coalesced.
-__kernel void spmm_pf_forward(
-    __global const float *sino,
-    __global const int *row_ptr,    // (R*CP + 1,)
-    __global const int *col_k,
-    __global const float *val,
-    __global float *data,
-    const int R, const int My, const int CP
-){
-    int gid = get_global_id(0);
-    if (gid >= R * CP * My) return;
-    int y = gid % My;
-    int row = gid / My;
-    int r = row / CP;
-    int j = row % CP;
-    float acc = 0.0f;
-    for (int i = row_ptr[row]; i < row_ptr[row + 1]; ++i)
-        acc += val[i] * sino[y + My * (r + R * col_k[i])];
-    data[(r * My + y) * CP + j] += acc;
-}
-
-// sino[y, r, k] = alpha * sum_j pf[r, k, j] * data[r, y, j]
-// (written straight into gratopy's (My, R, Kmax) Fortran-order sinogram)
-__kernel void spmm_pf_adjoint(
-    __global const float *data,
-    __global const int *row_ptr,    // (R*Kb + 1,)
-    __global const int *col_j,
-    __global const float *val,
-    __global float *sino,
-    const int R, const int My, const int Kb, const int CP, const float alpha
-){
-    int gid = get_global_id(0);
-    if (gid >= R * Kb * My) return;
-    int y = gid % My;
-    int row = gid / My;
-    int r = row / Kb;
-    int k = row % Kb;
-    int base = (r * My + y) * CP;
-    float acc = 0.0f;
-    for (int i = row_ptr[row]; i < row_ptr[row + 1]; ++i)
-        acc += val[i] * data[base + col_j[i]];
-    sino[y + My * (r + R * k)] = alpha * acc;
-}
-
-
 __kernel void scatter_k_batch_c(
     __global float *dst,        // (R, Mx, Ktot) C-order
     __global const float *src,  // (R, Mx, Kb)   C-order
@@ -623,3 +575,55 @@ __kernel void scatter_k_batch_c(
     dst[dst_idx] = src[src_idx];
 }
 
+
+
+// ---------------------------------------------------------------------------
+// Sparse PF products for the channel-fastest sinogram layout (R, My, Kstride)
+// C-order, used with diffractom's own projector (ParallelRadon).
+// ---------------------------------------------------------------------------
+
+// data[r, y, j] += sum_k pf[r, k, j] * sino[r, y, k]
+__kernel void spmm_pf_forward_c(
+    __global const float *sino,         // (R, My, Kstride)
+    __global const int *row_ptr,        // (R*CP + 1,)
+    __global const int *col_k,
+    __global const float *val,
+    __global float *data,               // (R, My, CP)
+    const int R, const int My, const int CP, const int Kstride
+){
+    int gid = get_global_id(0);
+    if (gid >= R * My * CP) return;
+    int j = gid % CP;
+    int tmp = gid / CP;
+    int y = tmp % My;
+    int r = tmp / My;
+    int row = r * CP + j;
+    __global const float *line = sino + ((size_t)r * My + y) * Kstride;
+    float acc = 0.0f;
+    for (int i = row_ptr[row]; i < row_ptr[row + 1]; ++i)
+        acc += val[i] * line[col_k[i]];
+    data[gid] += acc;
+}
+
+// sino[r, y, k] = alpha * sum_j pf[r, k, j] * data[r, y, j]   for k < Kb
+__kernel void spmm_pf_adjoint_c(
+    __global const float *data,         // (R, My, CP)
+    __global const int *row_ptr,        // (R*Kb + 1,)
+    __global const int *col_j,
+    __global const float *val,
+    __global float *sino,               // (R, My, Kstride)
+    const int R, const int My, const int Kb, const int CP, const int Kstride, const float alpha
+){
+    int gid = get_global_id(0);
+    if (gid >= R * My * Kb) return;
+    int k = gid % Kb;
+    int tmp = gid / Kb;
+    int y = tmp % My;
+    int r = tmp / My;
+    int row = r * Kb + k;
+    __global const float *line = data + ((size_t)r * My + y) * CP;
+    float acc = 0.0f;
+    for (int i = row_ptr[row]; i < row_ptr[row + 1]; ++i)
+        acc += val[i] * line[col_j[i]];
+    sino[((size_t)r * My + y) * Kstride + k] = alpha * acc;
+}

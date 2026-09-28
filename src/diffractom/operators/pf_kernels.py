@@ -56,8 +56,8 @@ class Kernels:
     pf_fill_rows_fwd: cl.Kernel
     pf_count_rows_adj: cl.Kernel
     pf_fill_rows_adj: cl.Kernel
-    spmm_pf_forward: cl.Kernel
-    spmm_pf_adjoint: cl.Kernel
+    spmm_pf_forward_c: cl.Kernel
+    spmm_pf_adjoint_c: cl.Kernel
 
 
 # One authoritative mapping from "public attribute" -> "program symbol"
@@ -92,8 +92,8 @@ _KERNEL_MAP: Final[tuple[tuple[str, str], ...]] = (
     ("pf_fill_rows_fwd", "pf_fill_rows_fwd"),
     ("pf_count_rows_adj", "pf_count_rows_adj"),
     ("pf_fill_rows_adj", "pf_fill_rows_adj"),
-    ("spmm_pf_forward", "spmm_pf_forward"),
-    ("spmm_pf_adjoint", "spmm_pf_adjoint"),
+    ("spmm_pf_forward_c", "spmm_pf_forward_c"),
+    ("spmm_pf_adjoint_c", "spmm_pf_adjoint_c"),
 )
 
 

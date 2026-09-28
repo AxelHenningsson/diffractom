@@ -330,7 +330,7 @@ class FISTAHuber:
             # ---- L2 data term (diagnostic only) ----
             # f = 0.5 * || (w*(Ax-b)) ||^2   if weights is provided
             # f = 0.5 * || (Ax-b) ||^2       otherwise
-            r2 = float(np.dot(r.get().ravel(), r.get().ravel()))
+            r2 = float(clarray.vdot(r, r).get())  # on the GPU (copying r to the host dominated the iteration time)
             fval = 0.5 * float(r2)
 
             # ---- huber: r <- clip(r, -delta, +delta) ----

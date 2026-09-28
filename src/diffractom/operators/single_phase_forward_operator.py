@@ -12,6 +12,7 @@ from ..crystallography.material import Material
 from scipy.spatial.transform import Rotation as R
 from .create_pfo_matrix import build_pf_program
 from .pf_kernels import build_all_opencl
+from .parallel_radon import ParallelRadon
 
 
 class SinglePhaseForwardOperator:
@@ -35,6 +36,7 @@ class SinglePhaseForwardOperator:
         pf_mode: str = "auto",
         sparse_max_fill: float = 0.1,
         sparse_max_gb: float | None = None,
+        projector: str = "native",
         **kwargs,
     ):
         """Initialise the single-material forward operator.
@@ -79,6 +81,12 @@ class SinglePhaseForwardOperator:
         sparse_max_gb : float, optional
             GPU memory budget (GB) for the sparse matrix, estimated from the first
             batch. Default: half of the device's global memory.
+        projector : {"native", "gratopy"}
+            Parallel-beam Radon transform used for the tomographic part.
+            ``"native"`` (default) is diffractom's ParallelRadon, vectorised over
+            the orientations; ``"gratopy"`` uses gratopy. Both use the same
+            discretisation (they agree to float32 rounding); the native one is
+            2-8x faster for many orientations.
         **kwargs
             Override any cfg key (e.g. ``N_Omega=50``).
         """
@@ -143,17 +151,36 @@ class SinglePhaseForwardOperator:
 
 
 
-        #        --- 2) Create ProjectionSettings using THIS queue ---
-        self.PS = gratopy.ProjectionSettings(
-            self.queue,
-            gratopy.PARALLEL,
-            (self.Nx, self.Ny, self.K_batch_max),
-            self.angles,
-            n_detectors=self.My,
-            image_width=self.Nx,
-            detector_width=self.My,
-            detector_shift=self.cor_offset,
-        )
+        # --- tomographic projector ---
+        if projector not in ("native", "gratopy"):
+            raise ValueError(f"projector must be 'native' or 'gratopy', not {projector!r}")
+        self.projector = projector
+        if projector == "native":
+            # angle weight = angular width of a projection (for a 180 degree range this
+            # equals gratopy's default weights, so both projectors agree)
+            self.radon = ParallelRadon(
+                self.queue,
+                (self.Nx, self.Ny),
+                self.angles,
+                self.My,
+                image_width=self.Nx,
+                detector_width=self.My,
+                detector_shift=self.cor_offset,
+                angle_weights=delta,
+                bins_per_item=3,
+            )
+            self.PS = None
+        else:
+            self.PS = gratopy.ProjectionSettings(
+                self.queue,
+                gratopy.PARALLEL,
+                (self.Nx, self.Ny, self.K_batch_max),
+                self.angles,
+                n_detectors=self.My,
+                image_width=self.Nx,
+                detector_width=self.My,
+                detector_shift=self.cor_offset,
+            )
         assert self.queue.context.int_ptr == self.ctx.int_ptr
 
 
@@ -323,13 +350,8 @@ class SinglePhaseForwardOperator:
             buffers.append((name, arr))
             return arr
 
-        self.coeffs_sino_F = _alloc(
-            "coeffs_sino_F",
-            (self.PS.n_detectors, self.PS.n_angles, self.K_batch_max),
-            np.float32,
-            "F",
-        )
-
+        # sinogram batch, orientations fastest: the native projector's output and input,
+        # and the layout of the PF products
         self.coeffs_sino_C = _alloc(
             "coeffs_sino_C",
             (self.N_Omega, self.My, self.K_batch_max),
@@ -337,12 +359,28 @@ class SinglePhaseForwardOperator:
             "C",
         )
 
-        self._coeffs_batch_F = _alloc(
-            "_coeffs_batch_F",
-            (self.Nx, self.Ny, self.K_batch_max),
-            np.float32,
-            "F",
-        )
+        if self.projector == "native":
+            # image batch, orientations fastest: (Nx*Ny, K_batch_max)
+            self._img_k = _alloc(
+                "_img_k",
+                (self.Nx * self.Ny * self.K_batch_max,),
+                np.float32,
+                "C",
+            )
+        else:
+            self.coeffs_sino_F = _alloc(
+                "coeffs_sino_F",
+                (self.PS.n_detectors, self.PS.n_angles, self.K_batch_max),
+                np.float32,
+                "F",
+            )
+
+            self._coeffs_batch_F = _alloc(
+                "_coeffs_batch_F",
+                (self.Nx, self.Ny, self.K_batch_max),
+                np.float32,
+                "F",
+            )
 
         self._basis_batch_kmax = _alloc(
             "_basis_batch_kmax",
@@ -384,6 +422,7 @@ class SinglePhaseForwardOperator:
             "coeffs_sino_F",
             "coeffs_sino_C",
             "_coeffs_batch_F",
+            "_img_k",
             "_basis_batch_kmax",
         ]
         for sb in (getattr(self, "sparse_batches", None) or []):
@@ -486,6 +525,9 @@ class SinglePhaseForwardOperator:
 
         self.batches = batches
         self.K_batch_max = max(b["K_batch"] for b in self.batches)
+        # multiple of 4: the native projector handles 4 orientations per work item
+        # (the padding rows of the PF matrix are zero)
+        self.K_batch_max = -(-self.K_batch_max // 4) * 4
     
 
 
@@ -642,91 +684,86 @@ class SinglePhaseForwardOperator:
         """
         data.fill(0.0)
 
-        R  = int(self.N_Omega)
-        C = int(self.N_eta)
-        P = int(self.N_peaks)
+        R = int(self.N_Omega)
+        CP = int(self.N_eta * self.N_peaks)
         Kmax = self.K_batch_max
-        Nx = self.Nx
-        Ny = self.Ny
         My = self.My
-        N_Omega = self.N_Omega
         sparse = self.pf_mode == "sparse"
 
         for ib, b in enumerate(self.batches):
             k0 = b["k_start"]
             Kb = b["K_batch"]
 
-            self._coeffs_batch_F.fill(0.0)
-            self.coeffs_sino_F.fill(0.0)
+            # 1) Radon transform of this batch -> coeffs_sino_C (R, My, Kmax)
+            if self.projector == "native":
+                self.radon.gather(coeffs, self._img_k, k0, Kb, Kmax)
+                self.radon.forward(self._img_k, self.coeffs_sino_C, Kmax)
+            else:
+                self._radon_gratopy_forward(coeffs, k0, Kb)
 
-            total = Nx * Ny * Kb
-            self.k.SLICE_COEFFS_K_BATCH_F(
-                self.queue,
-                (total,),
-                None,
-                coeffs.data,               # COEFFS_IN
-                self._coeffs_batch_F.data,       # COEFFS_OUT
-                np.int32(Nx),
-                np.int32(Ny),
-                np.int32(self.K),
-                np.int32(Kb),
-                np.int32(k0),
-            )
-
-            # -------------------------------------------------
-            # 2) Tomographic projection (batched in K)
-            # -------------------------------------------------
-
-            gratopy.forwardprojection(
-                self._coeffs_batch_F,
-                self.PS,
-                sino=self.coeffs_sino_F,
-            )
-
+            # 2) PF matrix product, accumulated into data
             if sparse:
-                # -------------------------------------------------
-                # 3) Sparse PF product, straight from gratopy's (My, R, K) sinogram
-                # -------------------------------------------------
                 sb = self.sparse_batches[ib]
-                self.k.spmm_pf_forward(
+                self.k.spmm_pf_forward_c(
                     self.queue,
-                    (R * C * P * My,),
+                    (R * My * CP,),
                     None,
-                    self.coeffs_sino_F.data,
+                    self.coeffs_sino_C.data,
                     sb["row_ptr_f"].data,
                     sb["col_k"].data,
                     sb["val_f"].data,
                     data.data,
                     np.int32(R),
                     np.int32(My),
-                    np.int32(C * P),
+                    np.int32(CP),
+                    np.int32(Kmax),
                 )
-                continue
+            else:
+                self._dense_pf_batch(k0, Kb)
+                batched_gemm_clblast(self.queue, self.coeffs_sino_C, self._basis_batch_kmax.reshape((R, Kmax, CP)),
+                                     data, R=R, M=My, K=Kmax, N=CP)
 
-            # -------------------------------------------------
-            # 3) Transpose sino F → C
-            # -------------------------------------------------
 
-            self.coeffs_sino_C.fill(0.0)
-            total = N_Omega * My * Kmax
-            self.k.transpose_d_omega_k_f_to_c(
-                self.queue,
-                (total,),
-                None,
-                self.coeffs_sino_F.data,
-                self.coeffs_sino_C.data,
-                np.int32(My),
-                np.int32(N_Omega),
-                np.int32(Kmax),
-                np.int32(total),
-            )
 
-            # -------------------------------------------------
-            # 4) PF + GEMM for this batch
-            # -------------------------------------------------
+    def _radon_gratopy_forward(self, coeffs, k0, Kb):
+        """gratopy forward projection of orientations k0 .. k0+Kb-1 into coeffs_sino_C."""
+        Nx, Ny, My, R, Kmax = self.Nx, self.Ny, self.My, self.N_Omega, self.K_batch_max
+        self._coeffs_batch_F.fill(0.0)
+        self.coeffs_sino_F.fill(0.0)
+        total = Nx * Ny * Kb
+        self.k.SLICE_COEFFS_K_BATCH_F(
+            self.queue, (total,), None,
+            coeffs.data, self._coeffs_batch_F.data,
+            np.int32(Nx), np.int32(Ny), np.int32(self.K), np.int32(Kb), np.int32(k0),
+        )
+        gratopy.forwardprojection(self._coeffs_batch_F, self.PS, sino=self.coeffs_sino_F)
+        total = R * My * Kmax
+        self.k.transpose_d_omega_k_f_to_c(
+            self.queue, (total,), None,
+            self.coeffs_sino_F.data, self.coeffs_sino_C.data,
+            np.int32(My), np.int32(R), np.int32(Kmax), np.int32(total),
+        )
 
-            self._dense_pf_batch(k0, Kb)
-            batched_gemm_clblast(self.queue, self.coeffs_sino_C, self._basis_batch_kmax.reshape((R, Kmax, C*P)), data, R=R, M=My, K=Kmax, N=P*C)
+
+
+    def _radon_gratopy_backward(self, coeffs, k0, Kb):
+        """gratopy backprojection of coeffs_sino_C into orientations k0 .. k0+Kb-1 of coeffs."""
+        Nx, Ny, My, R, Kmax = self.Nx, self.Ny, self.My, self.N_Omega, self.K_batch_max
+        self._coeffs_batch_F.fill(0.0)
+        self.coeffs_sino_F.fill(0.0)
+        total = R * My * Kmax
+        self.k.transpose_omega_d_k_c_to_d_omega_k_f(
+            self.queue, (total,), None,
+            self.coeffs_sino_C.data, self.coeffs_sino_F.data,
+            np.int32(R), np.int32(My), np.int32(Kmax), np.int32(total),
+        )
+        gratopy.backprojection(self.coeffs_sino_F, self.PS, img=self._coeffs_batch_F)
+        total = Nx * Ny * Kb
+        self.k.scatter_k_lastaxis_f(
+            self.queue, (total,), None,
+            coeffs.data, self._coeffs_batch_F.data,
+            np.int32(Nx), np.int32(Ny), np.int32(self.K), np.int32(k0), np.int32(Kb), np.int32(total),
+        )
 
 
 
@@ -781,11 +818,8 @@ class SinglePhaseForwardOperator:
         coeffs.fill(0.0)
 
         Kmax = self.K_batch_max
-        R  = self.N_Omega
-        C = int(self.N_eta)
-        P = int(self.N_peaks)
-        Nx = self.Nx
-        Ny = self.Ny
+        R = self.N_Omega
+        CP = int(self.N_eta * self.N_peaks)
         My = self.My
         alpha = R / np.pi
         sparse = self.pf_mode == "sparse"
@@ -794,70 +828,37 @@ class SinglePhaseForwardOperator:
             k0 = b["k_start"]
             Kb = b["K_batch"]
 
-            self._coeffs_batch_F.fill(0.0)
-            self.coeffs_sino_F.fill(0.0)
-
+            # 1) PF^T product -> coeffs_sino_C (R, My, Kmax)
             if sparse:
-                # Sparse PF^T product, straight into gratopy's (My, R, K) sinogram
                 sb = self.sparse_batches[ib]
-                self.k.spmm_pf_adjoint(
+                self.k.spmm_pf_adjoint_c(
                     self.queue,
-                    (R * Kb * My,),
+                    (R * My * Kb,),
                     None,
                     data.data,
                     sb["row_ptr_a"].data,
                     sb["col_j"].data,
                     sb["val_a"].data,
-                    self.coeffs_sino_F.data,
+                    self.coeffs_sino_C.data,
                     np.int32(R),
                     np.int32(My),
                     np.int32(Kb),
-                    np.int32(C * P),
+                    np.int32(CP),
+                    np.int32(Kmax),
                     np.float32(alpha),
                 )
             else:
                 self._dense_pf_batch(k0, Kb)
+                # batched gemm with the PF batch transposed on the fly; overwrites coeffs_sino_C
+                batched_gemm_adj_clblast(self.queue, data, self._basis_batch_kmax.reshape((R, Kmax, CP)),
+                                         self.coeffs_sino_C, R, My, CP, Kmax, alpha)
 
-                # batched gemm with the PF batch transposed (no explicit transpose); overwrites self.coeffs_sino_C
-                batched_gemm_adj_clblast(self.queue, data, self._basis_batch_kmax.reshape((R, Kmax, C*P)), self.coeffs_sino_C, R, My, P*C, Kmax, alpha)
-
-                # Transpose
-                total = R*My*Kmax
-                self.k.transpose_omega_d_k_c_to_d_omega_k_f(
-                    self.queue,
-                    (total,),
-                    None,
-                    self.coeffs_sino_C.data,
-                    self.coeffs_sino_F.data,
-                    np.int32(R),
-                    np.int32(My),
-                    np.int32(Kmax),
-                    np.int32(total),
-                )
-
-            # Backproject
-            gratopy.backprojection(
-                self.coeffs_sino_F,
-                self.PS,
-                img=self._coeffs_batch_F,
-            )
-
-
-            total = Nx * Ny * Kb
-
-            self.k.scatter_k_lastaxis_f(
-                self.queue,
-                (total,),
-                None,
-                coeffs.data,              # dst
-                self._coeffs_batch_F.data,# src
-                np.int32(Nx),
-                np.int32(Ny),
-                np.int32(self.K),
-                np.int32(k0),
-                np.int32(Kb),
-                np.int32(total),
-            )
+            # 2) backprojection into orientations k0 .. k0+Kb-1 of coeffs
+            if self.projector == "native":
+                self.radon.backward(self.coeffs_sino_C, self._img_k, Kmax)
+                self.radon.scatter(self._img_k, coeffs, k0, Kb, Kmax)
+            else:
+                self._radon_gratopy_backward(coeffs, k0, Kb)
 
 
 
