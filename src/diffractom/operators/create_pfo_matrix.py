@@ -82,6 +82,80 @@ __kernel void pfmatrix_eval(
 
     out[gid] = (w_total / (float)(S * S_eta)) * norm_factor[k];
 }
+
+
+// Same PF matrix as pfmatrix_eval, from precomputed poles instead of symmetry operators.
+//
+// For reflection p, the symmetry images S_g h_p coincide in groups: they span only a few
+// distinct axes (up to sign), and the summand of pfmatrix_eval is even in the sign of the
+// axis. So each distinct axis a is evaluated once and weighted by axis_count[a], the number
+// of images on it. The axes are rotated into the sample frame beforehand,
+// poles[k, a] = U_k * axis_a, so dot(S_g h_p, U_k^-1 v) = dot(poles[k, a], v).
+__kernel void pfmatrix_eval_poles(
+    __global const float *coords,      // (R, S_omega, C, S_eta, P, 3) flattened
+    __global const float *poles,       // (Ktot, A, 3): distinct pole axes rotated by every orientation
+    __global const int *axis_start,    // (P+1,): axes of reflection p are axis_start[p] .. axis_start[p+1]-1
+    __global const float *axis_count,  // (A,): number of symmetry images on each axis
+    __global const float *inv_sigma2,  // (Ktot,) 1 / sigma_k^2
+    __global const float *norm_factor, // (Ktot,) 1 / (8*pi*sigma_k^2)
+
+    __global float *out,               // (R, Kmax, C, P) flattened
+
+    const int R,
+    const int Kmax,
+    const int C,
+    const int P,
+    const int A,
+    const int S,                       // number of omega subdivisions
+    const int S_eta,                   // number of eta subdivisions
+    const int k0,                      // first orientation of this batch
+    const int Kb                       // orientations in this batch; rows Kb .. Kmax-1 are set to zero
+){
+    int gid = get_global_id(0);
+    int total = R * Kmax * C * P;
+    if (gid >= total) return;
+
+    // decode gid for layout out[r,k,c,p]
+    int p = gid % P;
+    int tmp = gid / P;
+    int c = tmp % C;
+    tmp /= C;
+    int k = tmp % Kmax;
+    int r = tmp / Kmax;
+
+    if (k >= Kb) {
+        out[gid] = 0.0f;
+        return;
+    }
+    int kg = k0 + k;
+    float inv_sig2 = inv_sigma2[kg];
+    int a0 = axis_start[p];
+    int a1 = axis_start[p + 1];
+    int pole_base = kg * A * 3;
+
+    float w_total = 0.0f;
+    for (int s = 0; s < S; ++s) {
+        for (int se = 0; se < S_eta; ++se) {
+            int coord_base = ((((r * S + s) * C + c) * S_eta + se) * P + p) * 3;
+            float vx = coords[coord_base + 0];
+            float vy = coords[coord_base + 1];
+            float vz = coords[coord_base + 2];
+
+            for (int a = a0; a < a1; ++a) {
+                int b = pole_base + a * 3;
+                float d = fabs(poles[b + 0]*vx + poles[b + 1]*vy + poles[b + 2]*vz);
+                float t = 0.0f;
+                float e1 = (1.0f - d) * inv_sig2;
+                if (e1 < 6.0f) t += exp(-e1);
+                float e2 = (1.0f + d) * inv_sig2;
+                if (e2 < 6.0f) t += exp(-e2);
+                w_total += axis_count[a] * t;
+            }
+        }
+    }
+
+    out[gid] = (w_total / (float)(S * S_eta)) * norm_factor[kg];
+}
 """
 
 PFSPARSE_KERNEL_SRC = r"""

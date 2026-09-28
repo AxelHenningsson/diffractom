@@ -51,6 +51,14 @@ class Kernels:
     SLICE_GRIDINV_K_BATCH: cl.Kernel
     SCALE_PF_BY_INTENSITY_INPLACE: cl.Kernel
 
+    # ---- sparse PF matrix ----
+    pf_count_rows_fwd: cl.Kernel
+    pf_fill_rows_fwd: cl.Kernel
+    pf_count_rows_adj: cl.Kernel
+    pf_fill_rows_adj: cl.Kernel
+    spmm_pf_forward: cl.Kernel
+    spmm_pf_adjoint: cl.Kernel
+
 
 # One authoritative mapping from "public attribute" -> "program symbol"
 _KERNEL_MAP: Final[tuple[tuple[str, str], ...]] = (
@@ -78,6 +86,14 @@ _KERNEL_MAP: Final[tuple[tuple[str, str], ...]] = (
     ("SLICE_COEFFS_K_BATCH_F", "SLICE_COEFFS_K_BATCH_F"),
     ("SLICE_GRIDINV_K_BATCH", "SLICE_GRIDINV_K_BATCH"),
     ("SCALE_PF_BY_INTENSITY_INPLACE", "SCALE_PF_BY_INTENSITY_INPLACE"),
+
+    # ---- sparse PF matrix ----
+    ("pf_count_rows_fwd", "pf_count_rows_fwd"),
+    ("pf_fill_rows_fwd", "pf_fill_rows_fwd"),
+    ("pf_count_rows_adj", "pf_count_rows_adj"),
+    ("pf_fill_rows_adj", "pf_fill_rows_adj"),
+    ("spmm_pf_forward", "spmm_pf_forward"),
+    ("spmm_pf_adjoint", "spmm_pf_adjoint"),
 )
 
 

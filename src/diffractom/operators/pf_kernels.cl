@@ -467,6 +467,133 @@ __kernel void SCALE_PF_BY_INTENSITY_INPLACE(
 
 
 
+// ---------------------------------------------------------------------------
+// Sparse PF matrix
+//
+// The dense PF batch pf[r, k, j] (layout (R, Kmax, CP), j = c*P + p) is compacted
+// into two CSR structures per omega r:
+//   forward rows (r, j): the orientations k with pf[r, k, j] != 0
+//   adjoint rows (r, k): the segments j with pf[r, k, j] != 0
+// so that neither multiplication needs atomics. The count kernels give the row
+// lengths; the row pointers are their prefix sums.
+// ---------------------------------------------------------------------------
+
+__kernel void pf_count_rows_fwd(
+    __global const float *pf,    // (R, Kmax, CP)
+    __global int *counts,        // (R*CP,)
+    const int R, const int Kmax, const int CP, const int Kb
+){
+    int row = get_global_id(0);
+    if (row >= R * CP) return;
+    int r = row / CP;
+    int j = row % CP;
+    int n = 0;
+    for (int k = 0; k < Kb; ++k)
+        if (pf[(r * Kmax + k) * CP + j] != 0.0f) n++;
+    counts[row] = n;
+}
+
+__kernel void pf_fill_rows_fwd(
+    __global const float *pf,       // (R, Kmax, CP)
+    __global const int *row_ptr,    // (R*CP + 1,)
+    __global int *col_k,            // (nnz,)
+    __global float *val,            // (nnz,)
+    const int R, const int Kmax, const int CP, const int Kb
+){
+    int row = get_global_id(0);
+    if (row >= R * CP) return;
+    int r = row / CP;
+    int j = row % CP;
+    int i = row_ptr[row];
+    for (int k = 0; k < Kb; ++k) {
+        float v = pf[(r * Kmax + k) * CP + j];
+        if (v != 0.0f) { col_k[i] = k; val[i] = v; i++; }
+    }
+}
+
+__kernel void pf_count_rows_adj(
+    __global const float *pf,    // (R, Kmax, CP)
+    __global int *counts,        // (R*Kb,)
+    const int R, const int Kmax, const int CP, const int Kb
+){
+    int row = get_global_id(0);
+    if (row >= R * Kb) return;
+    int r = row / Kb;
+    int k = row % Kb;
+    int base = (r * Kmax + k) * CP;
+    int n = 0;
+    for (int j = 0; j < CP; ++j)
+        if (pf[base + j] != 0.0f) n++;
+    counts[row] = n;
+}
+
+__kernel void pf_fill_rows_adj(
+    __global const float *pf,       // (R, Kmax, CP)
+    __global const int *row_ptr,    // (R*Kb + 1,)
+    __global int *col_j,            // (nnz,)
+    __global float *val,            // (nnz,)
+    const int R, const int Kmax, const int CP, const int Kb
+){
+    int row = get_global_id(0);
+    if (row >= R * Kb) return;
+    int r = row / Kb;
+    int k = row % Kb;
+    int base = (r * Kmax + k) * CP;
+    int i = row_ptr[row];
+    for (int j = 0; j < CP; ++j) {
+        float v = pf[base + j];
+        if (v != 0.0f) { col_j[i] = j; val[i] = v; i++; }
+    }
+}
+
+// data[r, y, j] += sum_k pf[r, k, j] * sino[y, r, k]
+// sino is gratopy's (My, R, Kmax) Fortran-order sinogram, data is (R, My, CP) C-order.
+// One work item per (row = r*CP + j, y); consecutive items share the row and read
+// consecutive y, so the sinogram reads are coalesced.
+__kernel void spmm_pf_forward(
+    __global const float *sino,
+    __global const int *row_ptr,    // (R*CP + 1,)
+    __global const int *col_k,
+    __global const float *val,
+    __global float *data,
+    const int R, const int My, const int CP
+){
+    int gid = get_global_id(0);
+    if (gid >= R * CP * My) return;
+    int y = gid % My;
+    int row = gid / My;
+    int r = row / CP;
+    int j = row % CP;
+    float acc = 0.0f;
+    for (int i = row_ptr[row]; i < row_ptr[row + 1]; ++i)
+        acc += val[i] * sino[y + My * (r + R * col_k[i])];
+    data[(r * My + y) * CP + j] += acc;
+}
+
+// sino[y, r, k] = alpha * sum_j pf[r, k, j] * data[r, y, j]
+// (written straight into gratopy's (My, R, Kmax) Fortran-order sinogram)
+__kernel void spmm_pf_adjoint(
+    __global const float *data,
+    __global const int *row_ptr,    // (R*Kb + 1,)
+    __global const int *col_j,
+    __global const float *val,
+    __global float *sino,
+    const int R, const int My, const int Kb, const int CP, const float alpha
+){
+    int gid = get_global_id(0);
+    if (gid >= R * Kb * My) return;
+    int y = gid % My;
+    int row = gid / My;
+    int r = row / Kb;
+    int k = row % Kb;
+    int base = (r * My + y) * CP;
+    float acc = 0.0f;
+    for (int i = row_ptr[row]; i < row_ptr[row + 1]; ++i)
+        acc += val[i] * data[base + col_j[i]];
+    sino[y + My * (r + R * k)] = alpha * acc;
+}
+
+
 __kernel void scatter_k_batch_c(
     __global float *dst,        // (R, Mx, Ktot) C-order
     __global const float *src,  // (R, Mx, Kb)   C-order

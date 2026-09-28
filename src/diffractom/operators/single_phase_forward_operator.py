@@ -32,6 +32,8 @@ class SinglePhaseForwardOperator:
         normalized: bool = False,
         ctx: cl.Context | None = None,
         queue: cl.CommandQueue | None = None,
+        pf_mode: str = "dense",
+        sparse_max_fill: float = 0.02,
         **kwargs,
     ):
         """Initialise the single-material forward operator.
@@ -53,6 +55,20 @@ class SinglePhaseForwardOperator:
             If True, skip intensity scaling of the PF matrix.
         ctx, queue : optional
             Existing OpenCL context/queue; created automatically if None.
+        pf_mode : {"dense", "sparse", "auto"}
+            How the pole-figure (PF) matrix is applied.
+
+            * ``"dense"``: the PF matrix is evaluated batch by batch in every
+              call and applied with a dense batched GEMM. When all orientations
+              fit in one batch, it is evaluated once and reused.
+            * ``"sparse"``: the PF matrix is evaluated once here, stored in a
+              sparse (CSR) format, and applied with sparse kernels. Its entries
+              are exactly zero away from the poles, so this is the same operator.
+              Fastest for narrow kernels (small sigma).
+            * ``"auto"``: sparse if the fill fraction of the first batch is at
+              most ``sparse_max_fill``, dense otherwise.
+        sparse_max_fill : float
+            Fill-fraction threshold used by ``pf_mode="auto"``.
         **kwargs
             Override any cfg key (e.g. ``N_Omega=50``).
         """
@@ -106,11 +122,13 @@ class SinglePhaseForwardOperator:
         self.prg, self.k, self.pf_prg = build_all_opencl(self.ctx, ts=16)
         self.pf_prg = build_pf_program(self.ctx)
         self.pfmatrix_eval_kernel = cl.Kernel(self.pf_prg, "pfmatrix_eval")
+        self.pfpoles_kernel = cl.Kernel(self.pf_prg, "pfmatrix_eval_poles")
 
 
         self.transfer_material_parameters_to_gpu()
         self.detector_coordinates()
         self.transfer_grid_parameters_to_gpu()
+        self.transfer_pole_axes_to_gpu()
         self.get_pf_batches_for_material()  # list of dicts
 
 
@@ -131,6 +149,15 @@ class SinglePhaseForwardOperator:
 
         # Allocate buffers
         self.allocate_coefficient_buffer()
+
+        # --- PF matrix mode ---
+        if pf_mode not in ("dense", "sparse", "auto"):
+            raise ValueError(f"pf_mode must be 'dense', 'sparse' or 'auto', not {pf_mode!r}")
+        self.pf_mode = pf_mode
+        self._pf_cached = False  # dense mode, single batch: PF matrix already in _basis_batch_kmax
+        self.sparse_batches = None
+        if pf_mode in ("sparse", "auto"):
+            self.build_sparse_pf(auto=(pf_mode == "auto"), max_fill=sparse_max_fill)
 
 
     def detector_coordinates(self):
@@ -217,11 +244,57 @@ class SinglePhaseForwardOperator:
 
         self.grid_inv_gpu = clarray.to_device(self.queue, self.grid_inv_cpu)
 
+            # --- rotations (for the poles in the sample frame) ---
+        self.grid_rot_cpu = np.stack([n.R.as_matrix() for n in nodes], axis=0)
+
             # --- sigma per node ---
         self.sigma_cpu = np.array(
             [node.sigma for node in nodes],
             dtype=np.float32
             )
+
+
+
+    def transfer_pole_axes_to_gpu(self):
+        """
+        Upload the distinct pole axes of every reflection, rotated into the
+        sample frame of every orientation, for the pfmatrix_eval_poles kernel.
+
+        The symmetry images S_g h_p of a reflection coincide in groups: for the
+        cubic point group, the 24 images span only 3-12 distinct axes (up to
+        sign). The PF summand is even in the sign of the axis, so each distinct
+        axis is evaluated once, weighted by the number of images on it. This
+        gives the same sum as looping over all symmetry operators.
+        """
+        h = np.asarray(self.material.h_vecs_normed, dtype=np.float64)
+        sym = np.asarray(self.material.point_group_matrices, dtype=np.float64).reshape(-1, 3, 3)
+
+        axes, counts, start = [], [], [0]
+        for hp in h:
+            images = sym @ hp                                          # (G, 3)
+            # canonical sign: first non-zero component positive
+            first = np.argmax(np.abs(images) > 1e-6, axis=1)
+            images = images * np.sign(images[np.arange(len(images)), first])[:, None]
+            uniq, cnt = np.unique(np.round(images, 6), axis=0, return_counts=True)
+            axes.append(uniq / np.linalg.norm(uniq, axis=1, keepdims=True))
+            counts.append(cnt)
+            start.append(start[-1] + len(uniq))
+        axes = np.concatenate(axes)
+        self.N_axes = len(axes)
+        self.axis_start_cpu = np.asarray(start, dtype=np.int32)
+        self.axis_count_cpu = np.concatenate(counts).astype(np.float32)
+        assert np.all(np.diff(self.axis_start_cpu) > 0)
+        assert np.allclose(np.add.reduceat(self.axis_count_cpu, self.axis_start_cpu[:-1]), len(sym))
+
+        # poles[k, a] = U_k @ axis_a, since dot(S_g h, U_k^-1 v) = dot(U_k S_g h, v)
+        poles = np.einsum("kij,aj->kai", self.grid_rot_cpu, axes)
+        self.poles_gpu = clarray.to_device(self.queue, np.ascontiguousarray(poles, dtype=np.float32))
+        self.axis_start_gpu = clarray.to_device(self.queue, self.axis_start_cpu)
+        self.axis_count_gpu = clarray.to_device(self.queue, self.axis_count_cpu)
+
+        sigma = self.sigma_cpu
+        self.inv_sigma2_gpu = clarray.to_device(self.queue, (1.0 / (sigma * sigma)).astype(np.float32))
+        self.norm_factor_gpu = clarray.to_device(self.queue, (1.0 / (8.0 * np.pi * sigma * sigma)).astype(np.float32))
 
 
 
@@ -262,34 +335,6 @@ class SinglePhaseForwardOperator:
             "C",
         )
 
-        self._basis_batch_transpose_kmax = _alloc(
-            "_basis_batch_transpose_kmax",
-            (self.N_Omega, self.N_peaks * self.N_eta, self.K_batch_max),
-            np.float32,
-            "C",
-        )
-
-        self._grid_inv_kmax = _alloc(
-            "_grid_inv_kmax",
-            (self.K_batch_max, 9),
-            np.float32,
-            "C",
-        )
-
-        self._inv_sigma2_kmax = _alloc(
-            "_inv_sigma2_kmax",
-            (self.K_batch_max,),
-            np.float32,
-            "C",
-        )
-
-        self._norm_factor_kmax = _alloc(
-            "_norm_factor_kmax",
-            (self.K_batch_max,),
-            np.float32,
-            "C",
-        )
-
         # --------------------------------------------------
         # Verbose memory breakdown
         # --------------------------------------------------
@@ -324,11 +369,12 @@ class SinglePhaseForwardOperator:
             "coeffs_sino_C",
             "_coeffs_batch_F",
             "_basis_batch_kmax",
-            "_basis_batch_transpose_kmax",
-            "_grid_inv_kmax",
-            "_inv_sigma2_kmax",
-            "_norm_factor_kmax",
         ]
+        for sb in (getattr(self, "sparse_batches", None) or []):
+            for arr in sb.values():
+                if isinstance(arr, clarray.Array) and arr.base_data is not None:
+                    arr.base_data.release()
+        self.sparse_batches = None
 
         # Release buffers if they exist
         for name in buffer_names:
@@ -449,39 +495,139 @@ class SinglePhaseForwardOperator:
 
 
 
+    def _eval_pf_batch(self, k0, Kb):
+        """Evaluate the dense PF matrix of orientations k0 .. k0+Kb-1 into
+        _basis_batch_kmax, (R, K_batch_max, C, P); rows Kb .. K_batch_max-1 are zero."""
+        R = int(self.N_Omega)
+        C = int(self.N_eta)
+        P = int(self.N_peaks)
+        Kmax = self.K_batch_max
+        self.pfpoles_kernel(
+            self.queue,
+            (R * Kmax * C * P,),
+            None,
+            self.coords_gpu.data,
+            self.poles_gpu.data,
+            self.axis_start_gpu.data,
+            self.axis_count_gpu.data,
+            self.inv_sigma2_gpu.data,
+            self.norm_factor_gpu.data,
+            self._basis_batch_kmax.data,
+            np.int32(R),
+            np.int32(Kmax),
+            np.int32(C),
+            np.int32(P),
+            np.int32(self.N_axes),
+            np.int32(self.N_Omega_subdivisions),
+            np.int32(self.N_eta_subdivisions),
+            np.int32(k0),
+            np.int32(Kb),
+        )
+        if not self.normalized:
+            self._scale_pf_by_intensity_inplace(self._basis_batch_kmax, self.intens_gpu)
+
+
+
+    def _dense_pf_batch(self, k0, Kb):
+        """Make sure _basis_batch_kmax holds the PF matrix of this batch (dense mode).
+        With a single batch the matrix never changes, so it is evaluated only once."""
+        if self._pf_cached:
+            return
+        self._eval_pf_batch(k0, Kb)
+        self._pf_cached = len(self.batches) == 1
+
+
+
+    def build_sparse_pf(self, auto=False, max_fill=0.02):
+        """
+        Evaluate the PF matrix once and store it per K-batch in two CSR
+        structures: forward rows (r, j) listing orientations, and adjoint rows
+        (r, k) listing segments, j = c*P + p. With ``auto``, fall back to dense
+        mode if the fill fraction of the first batch exceeds ``max_fill``.
+        """
+        t0 = time.perf_counter()
+        q = self.queue
+        R = int(self.N_Omega)
+        CP = int(self.N_eta * self.N_peaks)
+        Kmax = self.K_batch_max
+        ints = lambda *a: [np.int32(v) for v in a]
+
+        def csr(count_kernel, fill_kernel, n_rows, Kb):
+            counts = clarray.empty(q, (n_rows,), np.int32)
+            count_kernel(q, (n_rows,), None, self._basis_batch_kmax.data, counts.data, *ints(R, Kmax, CP, Kb))
+            row_ptr = np.zeros(n_rows + 1, dtype=np.int64)
+            np.cumsum(counts.get(), out=row_ptr[1:])
+            nnz = int(row_ptr[-1])
+            if nnz >= 2**31:
+                raise ValueError("Too many non-zeros in one K-batch for int32 indices; lower max_gb.")
+            row_ptr_gpu = clarray.to_device(q, row_ptr.astype(np.int32))
+            col = clarray.empty(q, (max(nnz, 1),), np.int32)
+            val = clarray.empty(q, (max(nnz, 1),), np.float32)
+            fill_kernel(q, (n_rows,), None, self._basis_batch_kmax.data, row_ptr_gpu.data, col.data, val.data,
+                        *ints(R, Kmax, CP, Kb))
+            return row_ptr_gpu, col, val, nnz
+
+        sparse_batches = []
+        nnz_total = 0
+        for ib, b in enumerate(self.batches):
+            k0, Kb = b["k_start"], b["K_batch"]
+            self._eval_pf_batch(k0, Kb)
+            row_ptr_f, col_k, val_f, nnz = csr(self.k.pf_count_rows_fwd, self.k.pf_fill_rows_fwd, R * CP, Kb)
+            if auto and ib == 0 and nnz / (R * Kb * CP) > max_fill:
+                for arr in (row_ptr_f, col_k, val_f):
+                    arr.base_data.release()
+                self.pf_mode = "dense"
+                if self.verbose:
+                    print(f"PF matrix fill fraction {100 * nnz / (R * Kb * CP):.2f} % > "
+                          f"{100 * max_fill:.2f} %: using the dense PF path")
+                return
+            row_ptr_a, col_j, val_a, nnz_a = csr(self.k.pf_count_rows_adj, self.k.pf_fill_rows_adj, R * Kb, Kb)
+            assert nnz_a == nnz
+            sparse_batches.append(dict(row_ptr_f=row_ptr_f, col_k=col_k, val_f=val_f,
+                                       row_ptr_a=row_ptr_a, col_j=col_j, val_a=val_a))
+            nnz_total += nnz
+        q.finish()
+
+        self.sparse_batches = sparse_batches
+        self.pf_mode = "sparse"
+        self.sparse_nnz = nnz_total
+        self.sparse_fill = nnz_total / (R * self.K * CP)
+        # the dense batch buffer is only needed to build the sparse matrix
+        self._basis_batch_kmax.base_data.release()
+        self._basis_batch_kmax = None
+        if self.verbose:
+            nbytes = sum(a.nbytes for sb in sparse_batches for a in sb.values())
+            print(f"Sparse PF matrix: {nnz_total} non-zeros (fill {100 * self.sparse_fill:.3f} %), "
+                  f"{nbytes / 1024**2:.1f} MB, built in {time.perf_counter() - t0:.1f} s")
+
+
+
     def direct_cl(self, coeffs, data):
-        """In-place forward operator: data += PF @ Radon(coeffs).
+        """In-place forward operator: data = PF @ Radon(coeffs).
 
         Parameters
         ----------
         coeffs : clarray, (Nx, Ny, K), F-order
-        data : clarray, (N_Omega, My, N_seg), C-order — accumulated into.
+        data : clarray, (N_Omega, My, N_seg), C-order — overwritten.
         """
         data.fill(0.0)
 
         R  = int(self.N_Omega)
         C = int(self.N_eta)
         P = int(self.N_peaks)
-        G = int(len(self.sym_ops_cpu))
         Kmax = self.K_batch_max
         Nx = self.Nx
         Ny = self.Ny
         My = self.My
         N_Omega = self.N_Omega
-        coords_gpu   = self.coords_gpu
-        sym_ops_gpu  = self.sym_ops_gpu
-        h_gpu_normed        = self.h_gpu_normed
-        intensity_gpu = self.intens_gpu
+        sparse = self.pf_mode == "sparse"
 
-        for b in self.batches:
+        for ib, b in enumerate(self.batches):
             k0 = b["k_start"]
-            k1 = b["k_end"]
             Kb = b["K_batch"]
 
             self._coeffs_batch_F.fill(0.0)
-            self.coeffs_sino_C.fill(0.0)
             self.coeffs_sino_F.fill(0.0)
-
 
             total = Nx * Ny * Kb
             self.k.SLICE_COEFFS_K_BATCH_F(
@@ -507,10 +653,31 @@ class SinglePhaseForwardOperator:
                 sino=self.coeffs_sino_F,
             )
 
+            if sparse:
+                # -------------------------------------------------
+                # 3) Sparse PF product, straight from gratopy's (My, R, K) sinogram
+                # -------------------------------------------------
+                sb = self.sparse_batches[ib]
+                self.k.spmm_pf_forward(
+                    self.queue,
+                    (R * C * P * My,),
+                    None,
+                    self.coeffs_sino_F.data,
+                    sb["row_ptr_f"].data,
+                    sb["col_k"].data,
+                    sb["val_f"].data,
+                    data.data,
+                    np.int32(R),
+                    np.int32(My),
+                    np.int32(C * P),
+                )
+                continue
+
             # -------------------------------------------------
-            # 3) Transpose sino F → C (only Kb)
+            # 3) Transpose sino F → C
             # -------------------------------------------------
 
+            self.coeffs_sino_C.fill(0.0)
             total = N_Omega * My * Kmax
             self.k.transpose_d_omega_k_f_to_c(
                 self.queue,
@@ -528,51 +695,7 @@ class SinglePhaseForwardOperator:
             # 4) PF + GEMM for this batch
             # -------------------------------------------------
 
-
-            self._norm_factor_kmax.fill(0.0) # make sure that this is set to zero!
-            self._inv_sigma2_kmax.fill(0.0)
-            sigma = np.asarray(self.sigma_cpu[k0:k1], dtype=np.float32)
-            inv_sigma2_cpu = (1.0 / (sigma * sigma)).astype(np.float32)
-            norm_factor_cpu = (1.0 / (8.0 * np.pi * sigma * sigma)).astype(np.float32)
-            cl.enqueue_copy(self.queue, self._inv_sigma2_kmax.data, inv_sigma2_cpu, device_offset=0)
-            cl.enqueue_copy(self.queue, self._norm_factor_kmax.data, norm_factor_cpu, device_offset=0)
-
-            total = Kb * 9
-            self.k.SLICE_GRIDINV_K_BATCH(
-                self.queue,
-                (total,),
-                None,
-                self.grid_inv_gpu.data,      # input: (K_total, 9)
-                self._grid_inv_kmax.data,    # output: (K_batch_max, 9)
-                np.int32(self.K),            # K_IN  (total grid size)
-                np.int32(Kb),                # K_OUT (this batch size)
-                np.int32(k0),                # K_START
-            )
-
-            total = R * Kmax * C * P
-            self.pfmatrix_eval_kernel(
-                self.queue,
-                (total,),
-                None,
-                coords_gpu.data,
-                self._grid_inv_kmax.data,
-                sym_ops_gpu.data,
-                h_gpu_normed.data,
-                self._inv_sigma2_kmax.data,
-                self._norm_factor_kmax.data,
-                self._basis_batch_kmax.data,
-                np.int32(R),
-                np.int32(Kmax),
-                np.int32(C),
-                np.int32(P),
-                np.int32(G),
-                np.int32(self.N_Omega_subdivisions),
-                np.int32(self.N_eta_subdivisions),
-            )
-            if not self.normalized:
-                self._scale_pf_by_intensity_inplace(self._basis_batch_kmax, intensity_gpu)
-
-            # OBS: batched_gemm_clblast overwrites _data_batch, but we need to accumulate. Hence this trick
+            self._dense_pf_batch(k0, Kb)
             batched_gemm_clblast(self.queue, self.coeffs_sino_C, self._basis_batch_kmax.reshape((R, Kmax, C*P)), data, R=R, M=My, K=Kmax, N=P*C)
 
 
@@ -631,102 +754,56 @@ class SinglePhaseForwardOperator:
         R  = self.N_Omega
         C = int(self.N_eta)
         P = int(self.N_peaks)
-        G = int(len(self.sym_ops_cpu))
         Nx = self.Nx
         Ny = self.Ny
         My = self.My
-        coords_gpu   = self.coords_gpu
-        sym_ops_gpu  = self.sym_ops_gpu
-        h_gpu_normed        = self.h_gpu_normed
-        intensity_gpu = self.intens_gpu
+        alpha = R / np.pi
+        sparse = self.pf_mode == "sparse"
 
-        for b in self.batches:
+        for ib, b in enumerate(self.batches):
             k0 = b["k_start"]
-            k1 = b["k_end"]
             Kb = b["K_batch"]
 
             self._coeffs_batch_F.fill(0.0)
-            self.coeffs_sino_C.fill(0.0)
             self.coeffs_sino_F.fill(0.0)
 
+            if sparse:
+                # Sparse PF^T product, straight into gratopy's (My, R, K) sinogram
+                sb = self.sparse_batches[ib]
+                self.k.spmm_pf_adjoint(
+                    self.queue,
+                    (R * Kb * My,),
+                    None,
+                    data.data,
+                    sb["row_ptr_a"].data,
+                    sb["col_j"].data,
+                    sb["val_a"].data,
+                    self.coeffs_sino_F.data,
+                    np.int32(R),
+                    np.int32(My),
+                    np.int32(Kb),
+                    np.int32(C * P),
+                    np.float32(alpha),
+                )
+            else:
+                self._dense_pf_batch(k0, Kb)
 
-            # Create pf matrix batch
-            self._norm_factor_kmax.fill(0.0) # make sure that this is set to zero!
-            self._inv_sigma2_kmax.fill(0.0)
-            sigma = np.asarray(self.sigma_cpu[k0:k1], dtype=np.float32)
-            inv_sigma2_cpu = (1.0 / (sigma * sigma)).astype(np.float32)
-            norm_factor_cpu = (1.0 / (8.0 * np.pi * sigma * sigma)).astype(np.float32)
-            # Input the norm factors to a zero array, so the norm factor for the extra rows in the last batch are zero
-            cl.enqueue_copy(self.queue, self._inv_sigma2_kmax.data, inv_sigma2_cpu, device_offset=0)
-            cl.enqueue_copy(self.queue, self._norm_factor_kmax.data, norm_factor_cpu, device_offset=0)
+                # batched gemm with the PF batch transposed (no explicit transpose); overwrites self.coeffs_sino_C
+                batched_gemm_adj_clblast(self.queue, data, self._basis_batch_kmax.reshape((R, Kmax, C*P)), self.coeffs_sino_C, R, My, P*C, Kmax, alpha)
 
-            total = Kb*9
-            self.k.SLICE_GRIDINV_K_BATCH(
-                self.queue,
-                (total,),
-                None,
-                self.grid_inv_gpu.data,      # input: (K_total, 9)
-                self._grid_inv_kmax.data,    # output: (K_batch_max, 9)
-                np.int32(self.K),            # K_IN  (total grid size)
-                np.int32(Kb),                # K_OUT (this batch size)
-                np.int32(k0),                # K_START
-            )
-
-
-            total = R*Kmax*C*P
-            self.pfmatrix_eval_kernel(
-                self.queue,
-                (total,),
-                None,
-                coords_gpu.data,
-                self._grid_inv_kmax.data,
-                sym_ops_gpu.data,
-                h_gpu_normed.data,
-                self._inv_sigma2_kmax.data,
-                self._norm_factor_kmax.data,
-                self._basis_batch_kmax.data,
-                np.int32(R),
-                np.int32(Kmax),
-                np.int32(C),
-                np.int32(P),
-                np.int32(G),
-                np.int32(self.N_Omega_subdivisions),
-                np.int32(self.N_eta_subdivisions),
-            )
-            if not self.normalized:
-                self._scale_pf_by_intensity_inplace(self._basis_batch_kmax, intensity_gpu)
-
-            # Transpose the pf matrix
-            total = R*Kmax*C*P
-            self.k.btranspose_kernel(
-                self.queue,
-                (total,),
-                None,
-                self._basis_batch_kmax.data,
-                self._basis_batch_transpose_kmax.data,
-                np.int32(R),
-                np.int32(Kmax),
-                np.int32(C*P),
-                np.int32(total),
-            )
-
-            # batched gemm overwrites self.coeffs_sino_C
-            batched_gemm_adj_clblast(self.queue, data, self._basis_batch_transpose_kmax, self.coeffs_sino_C, R, My, P*C, Kmax, R/np.pi)
-            # Now transpose, backproject and depose the coefficients in the "coeffs" array
-
-            # Transpose
-            total = R*My*Kmax
-            self.k.transpose_omega_d_k_c_to_d_omega_k_f(
-                self.queue,
-                (total,),
-                None,
-                self.coeffs_sino_C.data,
-                self.coeffs_sino_F.data,
-                np.int32(R),
-                np.int32(My),
-                np.int32(Kmax),
-                np.int32(total),
-            )
+                # Transpose
+                total = R*My*Kmax
+                self.k.transpose_omega_d_k_c_to_d_omega_k_f(
+                    self.queue,
+                    (total,),
+                    None,
+                    self.coeffs_sino_C.data,
+                    self.coeffs_sino_F.data,
+                    np.int32(R),
+                    np.int32(My),
+                    np.int32(Kmax),
+                    np.int32(total),
+                )
 
             # Backproject
             gratopy.backprojection(
@@ -813,22 +890,25 @@ def batched_gemm_clblast(queue, A3, B3, C3, R, M, K, N):
 
 
 
-def batched_gemm_adj_clblast(queue, Y3, BT3, X3, R, Mx, Nsub, K, alpha):
-    """Batched adjoint GEMM: X = alpha * Y @ BT, per-batch (beta=0 overwrite)."""
+def batched_gemm_adj_clblast(queue, Y3, B3, X3, R, Mx, Nsub, K, alpha):
+    """Batched adjoint GEMM: X = alpha * Y @ B^T, per-batch (beta=0 overwrite).
+
+    B3 is the PF batch as stored, (R, K, Nsub); CLBlast transposes it on the fly.
+    """
 
     # 2D views (NO COPY)
     A = Y3.reshape((R * Mx, Nsub))   # (R*Mx, Nsub)
-    B = BT3.reshape((R * Nsub, K))   # (R*Nsub, K)
+    B = B3.reshape((R * K, Nsub))    # (R*K, Nsub), used transposed
     C = X3.reshape((R * Mx, K))      # (R*Mx, K)
 
     # leading dimensions (row-major)
     a_ld = Nsub
-    b_ld = K
+    b_ld = Nsub
     c_ld = K
 
     # batch strides (in elements)
     a_stride = Mx * Nsub
-    b_stride = Nsub * K
+    b_stride = K * Nsub
     c_stride = Mx * K
 
     gemmStridedBatched(
@@ -841,7 +921,7 @@ def batched_gemm_adj_clblast(queue, Y3, BT3, X3, R, Mx, Nsub, K, alpha):
         alpha=alpha,
         beta=0.0,
         a_transp=False,
-        b_transp=False,  # <<< now no ambiguity
+        b_transp=True,
     )
 
 
