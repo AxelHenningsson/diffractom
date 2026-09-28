@@ -475,7 +475,8 @@ __kernel void SCALE_PF_BY_INTENSITY_INPLACE(
 //   forward rows (r, j): the orientations k with pf[r, k, j] != 0
 //   adjoint rows (r, k): the segments j with pf[r, k, j] != 0
 // so that neither multiplication needs atomics. The count kernels give the row
-// lengths; the row pointers are their prefix sums.
+// lengths; the row pointers are their prefix sums. Column indices are 16 bit
+// (the operator checks that Kmax and CP are below 65536).
 // ---------------------------------------------------------------------------
 
 __kernel void pf_count_rows_fwd(
@@ -496,7 +497,7 @@ __kernel void pf_count_rows_fwd(
 __kernel void pf_fill_rows_fwd(
     __global const float *pf,       // (R, Kmax, CP)
     __global const int *row_ptr,    // (R*CP + 1,)
-    __global int *col_k,            // (nnz,)
+    __global ushort *col_k,         // (nnz,)
     __global float *val,            // (nnz,)
     const int R, const int Kmax, const int CP, const int Kb
 ){
@@ -507,7 +508,7 @@ __kernel void pf_fill_rows_fwd(
     int i = row_ptr[row];
     for (int k = 0; k < Kb; ++k) {
         float v = pf[(r * Kmax + k) * CP + j];
-        if (v != 0.0f) { col_k[i] = k; val[i] = v; i++; }
+        if (v != 0.0f) { col_k[i] = (ushort)k; val[i] = v; i++; }
     }
 }
 
@@ -530,7 +531,7 @@ __kernel void pf_count_rows_adj(
 __kernel void pf_fill_rows_adj(
     __global const float *pf,       // (R, Kmax, CP)
     __global const int *row_ptr,    // (R*Kb + 1,)
-    __global int *col_j,            // (nnz,)
+    __global ushort *col_j,         // (nnz,)
     __global float *val,            // (nnz,)
     const int R, const int Kmax, const int CP, const int Kb
 ){
@@ -542,7 +543,7 @@ __kernel void pf_fill_rows_adj(
     int i = row_ptr[row];
     for (int j = 0; j < CP; ++j) {
         float v = pf[base + j];
-        if (v != 0.0f) { col_j[i] = j; val[i] = v; i++; }
+        if (v != 0.0f) { col_j[i] = (ushort)j; val[i] = v; i++; }
     }
 }
 
@@ -586,7 +587,7 @@ __kernel void scatter_k_batch_c(
 __kernel void spmm_pf_forward_c(
     __global const float *sino,         // (R, My, Kstride)
     __global const int *row_ptr,        // (R*CP + 1,)
-    __global const int *col_k,
+    __global const ushort *col_k,
     __global const float *val,
     __global float *data,               // (R, My, CP)
     const int R, const int My, const int CP, const int Kstride
@@ -609,7 +610,7 @@ __kernel void spmm_pf_forward_c(
 __kernel void spmm_pf_adjoint_c(
     __global const float *data,         // (R, My, CP)
     __global const int *row_ptr,        // (R*Kb + 1,)
-    __global const int *col_j,
+    __global const ushort *col_j,
     __global const float *val,
     __global float *sino,               // (R, My, Kstride)
     const int R, const int My, const int Kb, const int CP, const int Kstride, const float alpha

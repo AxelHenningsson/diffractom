@@ -80,7 +80,12 @@ class SinglePhaseForwardOperator:
             The default, 10 %, is roughly where the two break even.
         sparse_max_gb : float, optional
             GPU memory budget (GB) for the sparse matrix, estimated from the first
-            batch. Default: half of the device's global memory.
+            batch. Default (``default_sparse_budget_gb``): half of the memory left
+            after reserving what a FISTA reconstruction needs besides the operator
+            (5 coefficient-sized and 4 data-sized arrays), the operator's own
+            buffers and a 1 GB margin. The solver's arrays take priority: a large
+            sparse matrix (e.g. a dense uniform grid) is not stored, and the dense
+            path re-evaluates the PF matrix batch by batch instead.
         projector : {"native", "gratopy"}
             Parallel-beam Radon transform used for the tomographic part.
             ``"native"`` (default) is diffractom's ParallelRadon, vectorised over
@@ -107,7 +112,9 @@ class SinglePhaseForwardOperator:
         self.grid = grid
         self.verbose = verbose
         self.N_eta = self.cfg['N_eta']
-        self.N_peaks = len(self.material.reflections)
+        # reflections with the same two-theta form one ring (one data channel)
+        self.ring_reflections = group_reflections_into_rings(self.material)
+        self.N_peaks = len(self.ring_reflections)  # number of rings
         self.N_seg = self.N_peaks * self.N_eta
         self.Nx = self.cfg['Nx']
         self.Ny = self.cfg['Ny']
@@ -194,7 +201,7 @@ class SinglePhaseForwardOperator:
         self._pf_cached = False  # dense mode, single batch: PF matrix already in _basis_batch_kmax
         self.sparse_batches = None
         if sparse_max_gb is None:
-            sparse_max_gb = self.queue.device.global_mem_size / 2 / 1024**3
+            sparse_max_gb = self.default_sparse_budget_gb()
         if pf_mode in ("sparse", "auto"):
             self.build_sparse_pf(auto=(pf_mode == "auto"), max_fill=sparse_max_fill, max_gb=sparse_max_gb)
         if self.verbose:
@@ -255,12 +262,20 @@ class SinglePhaseForwardOperator:
 
 
     def transfer_material_parameters_to_gpu(self):
-        """Upload reciprocal-lattice vectors, intensities and symmetry ops to GPU."""
-        self.h_cpu_normed = np.asarray(self.material.h_vecs_normed, dtype=np.float32, order="C")
-        self.h_cpu = np.asarray(self.material.h_vecs, dtype=np.float32, order="C")
+        """Upload reciprocal-lattice vectors, intensities and symmetry ops to GPU.
+
+        One entry per ring: the h-vectors are those of the first reflection of
+        each ring (they only set the ring's two-theta), the intensity of a ring
+        is the sum over its reflections.
+        """
+        first = [refl[0] for refl in self.ring_reflections]
+        self.h_cpu_normed = np.asarray(self.material.h_vecs_normed, dtype=np.float32)[first].copy(order="C")
+        self.h_cpu = np.asarray(self.material.h_vecs, dtype=np.float32)[first].copy(order="C")
         self.h_gpu_normed = clarray.to_device(self.queue, self.h_cpu_normed)
 
-        self.intens_cpu = np.asarray(self.material.intensities(), dtype=np.float32, order="C")
+        intensities = np.asarray(self.material.intensities(), dtype=np.float64)
+        self.intens_cpu = np.array([intensities[refl].sum() for refl in self.ring_reflections],
+                                   dtype=np.float32)
         self.intens_gpu = clarray.to_device(self.queue, self.intens_cpu)
 
         self.sym_ops_cpu = np.asarray(self.material.point_group_matrices, dtype=np.float32, order="C")
@@ -300,25 +315,47 @@ class SinglePhaseForwardOperator:
 
     def transfer_pole_axes_to_gpu(self):
         """
-        Upload the distinct pole axes of every reflection, rotated into the
-        sample frame of every orientation, for the pfmatrix_eval_poles kernel.
+        Upload the distinct pole axes of every ring, rotated into the sample
+        frame of every orientation, for the pfmatrix_eval_poles kernel.
 
-        The symmetry images S_g h_p of a reflection coincide in groups: for the
+        The symmetry images S_g h of a reflection coincide in groups: for the
         cubic point group, the 24 images span only 3-12 distinct axes (up to
         sign). The PF summand is even in the sign of the axis, so each distinct
         axis is evaluated once, weighted by the number of images on it. This
         gives the same sum as looping over all symmetry operators.
+
+        A ring with several reflection families (e.g. (333) and (511)) sums the
+        images of all of them, each family weighted by its share
+        w_f = m_f / sum(m) of the ring's multiplicity (or of its intensity, if
+        the PF matrix is scaled by intensity), so that every pole of the ring
+        counts equally. A single-family ring has w_f = 1, i.e. the plain sum.
         """
         h = np.asarray(self.material.h_vecs_normed, dtype=np.float64)
         sym = np.asarray(self.material.point_group_matrices, dtype=np.float64).reshape(-1, 3, 3)
+        multiplicity = np.asarray(self.material.reflections["multiplicity"], dtype=np.float64)
+        intensities = np.asarray(self.material.intensities(), dtype=np.float64)
 
         axes, counts, start = [], [], [0]
-        for hp in h:
-            images = sym @ hp                                          # (G, 3)
+        self.ring_family_weights = []
+        for refl in self.ring_reflections:
+            share = intensities[refl] if not self.normalized else multiplicity[refl]
+            if not np.all(np.isfinite(share)) or share.sum() <= 0:
+                share = multiplicity[refl]
+            share = share / share.sum()
+            self.ring_family_weights.append(share)
+
+            images, weights = [], []
+            for f, w in zip(refl, share):
+                img = sym @ h[f]                                       # (G, 3)
+                images.append(img)
+                weights.append(np.full(len(img), w))
+            images = np.concatenate(images)
+            weights = np.concatenate(weights)
             # canonical sign: first non-zero component positive
             first = np.argmax(np.abs(images) > 1e-6, axis=1)
             images = images * np.sign(images[np.arange(len(images)), first])[:, None]
-            uniq, cnt = np.unique(np.round(images, 6), axis=0, return_counts=True)
+            uniq, inverse = np.unique(np.round(images, 6), axis=0, return_inverse=True)
+            cnt = np.bincount(inverse.ravel(), weights=weights, minlength=len(uniq))
             axes.append(uniq / np.linalg.norm(uniq, axis=1, keepdims=True))
             counts.append(cnt)
             start.append(start[-1] + len(uniq))
@@ -596,6 +633,26 @@ class SinglePhaseForwardOperator:
 
 
 
+    def default_sparse_budget_gb(self):
+        """
+        Default GPU memory budget (GB) for the sparse PF matrix: half of what is
+        left of the device memory after a reserve for the solver (FISTA keeps
+        ~5 arrays of the coefficient size (Nx, Ny, K) and ~4 of the data size
+        (N_Omega, My, N_seg), including the data and weights), the operator's
+        buffers and a 1 GB margin. Conservative on purpose: the GPU may be
+        shared, and the solver's arrays take priority.
+        """
+        coeff_bytes = 4 * self.Nx * self.Ny * self.K
+        data_bytes = 4 * self.N_Omega * self.My * self.N_seg
+        buffers = getattr(self, "total_bytes", None)
+        if buffers is None:  # (only computed with verbose=True)
+            buffers = 4 * self.K_batch_max * (self.N_Omega * self.My + self.Nx * self.Ny
+                                              + self.N_Omega * self.N_eta * self.N_peaks)
+        free = self.queue.device.global_mem_size - 5 * coeff_bytes - 4 * data_bytes - buffers - 1024**3
+        return 0.5 * max(free, 0) / 1024**3
+
+
+
     def build_sparse_pf(self, auto=False, max_fill=0.1, max_gb=None):
         """
         Evaluate the PF matrix once and store it per K-batch in two CSR
@@ -614,6 +671,16 @@ class SinglePhaseForwardOperator:
         Kmax = self.K_batch_max
         ints = lambda *a: [np.int32(v) for v in a]
 
+        # column indices are stored as 16 bit (orientation within a batch, segment)
+        if Kmax > 65535 or CP > 65535:
+            reason = f"K_batch_max = {Kmax} or N_eta * N_rings = {CP} exceeds the 16-bit index range"
+            if not auto:
+                raise ValueError(f"Sparse PF matrix: {reason}; use pf_mode='dense' or a smaller max_gb.")
+            self.pf_mode = "dense"
+            if self.verbose:
+                print(f"Sparse PF matrix: {reason}, using the dense PF path")
+            return
+
         def csr(count_kernel, fill_kernel, n_rows, Kb):
             counts = clarray.empty(q, (n_rows,), np.int32)
             count_kernel(q, (n_rows,), None, self._basis_batch_kmax.data, counts.data, *ints(R, Kmax, CP, Kb))
@@ -623,7 +690,7 @@ class SinglePhaseForwardOperator:
             if nnz >= 2**31:
                 raise ValueError("Too many non-zeros in one K-batch for int32 indices; lower max_gb.")
             row_ptr_gpu = clarray.to_device(q, row_ptr.astype(np.int32))
-            col = clarray.empty(q, (max(nnz, 1),), np.int32)
+            col = clarray.empty(q, (max(nnz, 1),), np.uint16)
             val = clarray.empty(q, (max(nnz, 1),), np.float32)
             fill_kernel(q, (n_rows,), None, self._basis_batch_kmax.data, row_ptr_gpu.data, col.data, val.data,
                         *ints(R, Kmax, CP, Kb))
@@ -637,8 +704,8 @@ class SinglePhaseForwardOperator:
             row_ptr_f, col_k, val_f, nnz = csr(self.k.pf_count_rows_fwd, self.k.pf_fill_rows_fwd, R * CP, Kb)
             if ib == 0:
                 fill = nnz / (R * Kb * CP)
-                # two CSR copies (index + value, 4 B each) plus the row pointers of all batches
-                est_gb = (16 * fill * R * self.K * CP + 4 * (len(self.batches) * R * CP + R * self.K)) / 1024**3
+                # two CSR copies (16-bit index + 32-bit value) plus the row pointers of all batches
+                est_gb = (12 * fill * R * self.K * CP + 4 * (len(self.batches) * R * CP + R * self.K)) / 1024**3
                 reason = None
                 if auto and fill > max_fill:
                     reason = f"fill fraction {100 * fill:.2f} % > {100 * max_fill:.2f} %"
@@ -886,6 +953,23 @@ class SinglePhaseForwardOperator:
         )
 
 
+
+
+
+def group_reflections_into_rings(material, rtol=1e-6):
+    """
+    Group the reflections of a material into rings of equal two-theta, sorted
+    by increasing two-theta. Returns a list with, per ring, the indices of its
+    reflections, e.g. [[0], [1], ..., [9, 10], ...] when (333) and (511) share a ring.
+    """
+    tt = np.asarray(material.reflections["two_theta"], dtype=np.float64)
+    rings = []
+    for i in np.argsort(tt, kind="stable"):
+        if rings and np.isclose(tt[i], tt[rings[-1][0]], rtol=rtol, atol=0.0):
+            rings[-1].append(int(i))
+        else:
+            rings.append([int(i)])
+    return rings
 
 
 
