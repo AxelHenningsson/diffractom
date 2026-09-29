@@ -94,6 +94,12 @@ op = dt.PFO_SINGLE(cfg, material, grid)
 solver = dt.FISTAHuberOpenCL(op, lam=..., huber_delta=...)
 solver.run(x, data, niter=50)
 
+# The FISTA solvers constrain the reconstruction to the field of view by default
+# (support="fov": pixels whose centre projects onto the detector at every angle,
+# i.e. the disk r <= My/2 - |cor_offset| for a full rotation), assuming the sample
+# stays in the beam during the scan. support=None disables it; an (Nx, Ny) boolean
+# array gives a custom support.
+
 
 ## License
 Apache License 2.0

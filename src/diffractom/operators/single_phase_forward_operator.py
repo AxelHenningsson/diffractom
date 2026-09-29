@@ -13,6 +13,7 @@ from scipy.spatial.transform import Rotation as R
 from .create_pfo_matrix import build_pf_program
 from .pf_kernels import build_all_opencl
 from .parallel_radon import ParallelRadon
+from ..utils.support import fov_support_mask
 
 
 class SinglePhaseForwardOperator:
@@ -209,6 +210,11 @@ class SinglePhaseForwardOperator:
             print(f"PF matrix: {self.pf_mode}, "
                   + ("evaluated once" if cached else f"re-evaluated in {len(self.batches)} batches per call"))
 
+
+    def support_mask(self):
+        """(Nx, Ny) bool mask of the pixels inside the field of view at every projection angle."""
+        return fov_support_mask(self.Nx, self.Ny, self.My, angles=self.angles, image_width=self.Nx,
+                                detector_width=self.My, detector_shift=self.cor_offset)
 
     def detector_coordinates(self):
         """Compute probed unit-sphere coordinates for all (omega, eta, peak) combinations.

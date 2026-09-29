@@ -24,6 +24,12 @@ __kernel void prox_nonneg_l1(__global float *x, float lambda, int total) {
     float v = x[gid] - lambda;
     x[gid] = (v > 0.0f) ? v : 0.0f;
 }
+
+// x (Nx, Ny, K) Fortran order: zero every channel of the pixels outside the support
+__kernel void apply_support(__global float *x, __global const uchar *mask, int npix, int total) {
+    int gid = get_global_id(0);
+    if (gid < total && !mask[gid % npix]) x[gid] = 0.0f;
+}
 """
 
 
@@ -36,6 +42,7 @@ class ProxKernels:
         self.k_prox_nonneg     = cl.Kernel(self.prg, "prox_nonneg")
         self.k_prox_l1         = cl.Kernel(self.prg, "prox_l1")
         self.k_prox_nonneg_l1  = cl.Kernel(self.prg, "prox_nonneg_l1")
+        self.k_apply_support   = cl.Kernel(self.prg, "apply_support")
 
 
 def prox_nonneg(queue, kernels: ProxKernels, x_gpu):
@@ -76,4 +83,33 @@ def prox_nonneg_l1(queue, kernels: ProxKernels, x_gpu, lam, tau):
         np.float32(lam * tau),
         total,
     )
+    return x_gpu
+
+
+def support_mask_to_gpu(queue, operator, support):
+    """Resolve the ``support`` option of the FISTA solvers to a uint8 GPU mask (or None).
+
+    support : "fov" (the operator's field-of-view disk), None/False (no support
+    constraint), or an (Nx, Ny) boolean array.
+    """
+    if support is None or support is False:
+        return None
+    if isinstance(support, str):
+        if support != "fov":
+            raise ValueError(f"support must be 'fov', None or an (Nx, Ny) array, not {support!r}")
+        if not hasattr(operator, "support_mask"):
+            raise ValueError("the operator has no support_mask(); pass support=None or an array")
+        mask = operator.support_mask()
+    else:
+        mask = np.asarray(support)
+    if mask.shape != (operator.Nx, operator.Ny):
+        raise ValueError(f"support mask shape {mask.shape} != (Nx, Ny) = {(operator.Nx, operator.Ny)}")
+    return clarray.to_device(queue, np.asfortranarray(mask.astype(np.uint8)).ravel(order="F"))
+
+
+def apply_support(queue, kernels: ProxKernels, x_gpu, mask_gpu):
+    """Zero x (Nx, Ny, K, Fortran order) outside the support in place (projection onto the support)."""
+    total = np.int32(x_gpu.size)
+    kernels.k_apply_support(queue, (int(total),), None, x_gpu.data, mask_gpu.data,
+                            np.int32(mask_gpu.size), total)
     return x_gpu
