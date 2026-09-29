@@ -2,6 +2,7 @@
 
 from .crystallography.material import Material
 from .utils.grid import Grid
+from .utils.support import fov_support_mask
 from .operators.single_phase_forward_operator import SinglePhaseForwardOperator
 from .operators.multi_phase_forward_operator import MultiPhaseForwardOperator
 from .operators.bulk_texture_forward_operator import BulkTextureForwardOperator
@@ -24,6 +25,7 @@ from .utils.reinterpolation.reinterpolationS2 import (
 __all__ = [
     "Material",
     "Grid",
+    "fov_support_mask",
     "SinglePhaseForwardOperator",
     "MultiPhaseForwardOperator",
     "FISTAHuber",

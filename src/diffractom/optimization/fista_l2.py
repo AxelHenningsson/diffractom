@@ -4,7 +4,7 @@ import numpy as np
 import pyopencl as cl
 import pyopencl.array as clarray
 import pyopencl.clmath as clmath
-from .prox import prox_nonneg, prox_l1, prox_nonneg_l1, ProxKernels
+from .prox import prox_nonneg, prox_l1, prox_nonneg_l1, ProxKernels, apply_support, support_mask_to_gpu
 
 from .prox_tv import (
     TVProxKernels,
@@ -80,7 +80,7 @@ class FISTAL2:
     Ax layout: (O, D, Nseg) C
     """
 
-    def __init__(self, operator, prox_kind="nonneg", lam=0.0, L=None, tau=None, tv_niter=50):
+    def __init__(self, operator, prox_kind="nonneg", lam=0.0, L=None, tau=None, tv_niter=50, support="fov"):
         """Set up FISTA solver.
 
         Parameters
@@ -96,6 +96,11 @@ class FISTAL2:
             Step size (overrides L).
         tv_niter : int
             Inner iterations for TV proximal operator.
+        support : "fov", None or (Nx, Ny) bool array
+            Support constraint, applied after the proximal operator: the coefficients
+            of pixels outside the support are set to zero. "fov" (default) is the disk
+            seen by the detector at every angle (operator.support_mask()), i.e. the
+            assumption that the sample stays in the field of view; None disables it.
         """
         self.op = operator
         self.ctx = operator.ctx
@@ -108,6 +113,7 @@ class FISTAL2:
         self.k_extrapolate    = cl.Kernel(self.fista_prg, "extrapolate")
 
         self.prox_kernels = ProxKernels(self.ctx)
+        self.support_gpu = support_mask_to_gpu(self.queue, operator, support)
         self.tv_kernels = TVProxKernels(self.ctx)
 
         self.prox_kind = prox_kind
@@ -173,6 +179,9 @@ class FISTAL2:
             else:
                 raise ValueError(f"Unknown prox_kind: {self.prox_kind}")
 
+            if self.support_gpu is not None:
+                apply_support(self.queue, self.prox_kernels, x_gpu, self.support_gpu)
+
             return x_gpu
 
 
@@ -225,6 +234,8 @@ class FISTAL2:
             }
 
         # copy x0 -> x,y,x_old
+        if self.support_gpu is not None:  # start inside the support
+            apply_support(q, self.prox_kernels, x, self.support_gpu)
         total_x = np.int32(x.size)
         self.k_copy_buf(q, (int(total_x),), None, x.data, y.data, total_x)
         self.k_copy_buf(q, (int(total_x),), None, x.data, x_old.data, total_x)
